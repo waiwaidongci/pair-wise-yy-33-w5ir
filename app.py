@@ -11,6 +11,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from transfer_rules import TransferError
+from transfer_store import TransferService
+
 DB_PATH = Path(__file__).with_name("data.db")
 
 
@@ -116,6 +119,15 @@ class GridService:
                 self.store.audit(actor, "asset.register", "asset", cur.lastrowid, {"code": code, "capacity_mw": capacity_mw, "region": region})
         except sqlite3.IntegrityError as exc: raise ApiError(409, "资产代号已存在") from exc
         return {"id": cur.lastrowid, "code": code, "name": name, "asset_type": asset_type, "capacity_mw": capacity_mw, "region": region, "parent_id": parent_id}
+
+    def update_line_capacity(self, actor: str | None, role: str | None, asset_id: int, capacity_mw: float) -> dict:
+        actor = self._actor(actor, role, {"dispatcher"})
+        self._row("assets", asset_id)
+        if capacity_mw <= 0: raise ApiError(400, "线路容量必须为正数")
+        with self.conn:
+            self.conn.execute("UPDATE assets SET capacity_mw=? WHERE id=?", (float(capacity_mw), asset_id))
+            self.store.audit(actor, "asset.capacity_update", "asset", asset_id, {"capacity_mw": capacity_mw})
+        return dict(self._row("assets", asset_id))
 
     def register_facility(self, actor: str | None, role: str | None, name: str, facility_type: str, asset_id: int, priority: int, backup_power_mw: float) -> dict:
         actor = self._actor(actor, role, {"dispatcher"})
@@ -339,6 +351,7 @@ class GridService:
 
 class Handler(BaseHTTPRequestHandler):
     service: GridService
+    transfers: TransferService
 
     def log_message(self, fmt: str, *args: object) -> None: sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
     def _send(self, status: int, body: object) -> None:
@@ -354,18 +367,29 @@ class Handler(BaseHTTPRequestHandler):
             p = self._parts()
             if p in (["health"], ["api", "health"]): out = {"status": "ok"}
             elif p == ["api", "state"]: out = self.service.state()
+            elif p == ["api", "transfer-overview"]: out = self.transfers.overview()
+            elif p == ["api", "transfer-orders"]: out = self.transfers.list_orders()
             elif len(p) == 3 and p[:2] == ["api", "plans"]: out = self.service.plan_detail(int(p[2]))
             elif not p:
                 page = (Path(__file__).parent / "static" / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
+            elif p == ["transfer"]:
+                page = (Path(__file__).parent / "static" / "transfer.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
         except ApiError as exc: self._send(exc.status, {"error": exc.message})
+        except TransferError as exc: self._send(exc.status, {"error": exc.message})
         except Exception as exc: self._send(500, {"error": str(exc)})
 
     def do_POST(self) -> None:
         try:
             p, b = self._parts(), self._body(); actor, role = self.headers.get("X-Actor"), self.headers.get("X-Role")
             if p == ["api", "assets"]: out = self.service.register_asset(actor, role, b.get("code", ""), b.get("name", ""), b.get("asset_type", "line"), float(b.get("capacity_mw", 0)), b.get("region", ""), b.get("parent_id"))
+            elif len(p) == 4 and p[:2] == ["api", "assets"] and p[3] == "capacity":
+                out = self.service.update_line_capacity(actor, role, int(p[2]), float(b.get("capacity_mw", 0)))
+                self.transfers.recalculate_line(int(p[2]), actor or "system")
+            elif p == ["api", "transfer-orders"]: out = self.transfers.submit(actor, role, b.get("source_line_id"), b.get("target_line_id"), b.get("load_mw"), b.get("important_users", []))
+            elif len(p) == 4 and p[:2] == ["api", "transfer-orders"] and p[3] == "execute": out = self.transfers.execute(actor, role, int(p[2]))
+            elif len(p) == 4 and p[:2] == ["api", "transfer-orders"] and p[3] == "cancel": out = self.transfers.cancel(actor, role, int(p[2]), b.get("reason", ""))
             elif p == ["api", "facilities"]: out = self.service.register_facility(actor, role, b.get("name", ""), b.get("facility_type", "hospital"), int(b.get("asset_id", 0)), int(b.get("priority", 1)), float(b.get("backup_power_mw", 0)))
             elif p == ["api", "outages"]: out = self.service.create_outage(actor, role, b.get("incident_code", ""), b.get("title", ""), b.get("affected_regions", []))
             elif p == ["api", "telemetry"]: out = self.service.record_telemetry(actor, role, int(b.get("asset_id", 0)), float(b.get("load_mw", 0)), float(b.get("voltage_kv", 0)), b.get("timestamp", ""))
@@ -380,6 +404,7 @@ class Handler(BaseHTTPRequestHandler):
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
         except ApiError as exc: self._send(exc.status, {"error": exc.message})
+        except TransferError as exc: self._send(exc.status, {"error": exc.message})
         except (ValueError, TypeError, sqlite3.IntegrityError) as exc: self._send(400, {"error": str(exc)})
         except Exception as exc: self._send(500, {"error": str(exc)})
 
@@ -388,6 +413,7 @@ def run(port: int, db_path: str, seed: bool) -> None:
     store = Store(db_path); service = GridService(store)
     if seed: service.seed()
     Handler.service = service
+    Handler.transfers = TransferService(store)
     print(f"grid restoration listening on http://127.0.0.1:{port}")
     ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 

@@ -21,7 +21,13 @@ python3 app.py
 - `POST /api/field-reports`：合并现场离线报告，重复客户端编号不会重复写入。
 - `POST /api/plans/{id}/confirm`：调度员确认步骤，依赖未满足时拒绝。
 - `POST /api/status`：发布当前恢复状态。
+- `POST /api/transfer-orders`：登记转供单（源线路、目标线路、负荷、重要用户）。扣除原有承接及恢复预留后仍有余量、且源线路一级重要用户全部纳入才准许执行；同一目标线路只留一笔待执行单，重复提交沿用首次结果，内容变更则原许可失效并重算。
+- `POST /api/transfer-orders/{id}/execute`、`/cancel`：执行或取消待执行单。
+- `POST /api/assets/{id}/capacity`：调整线路容量，该线路待执行许可自动失效并按原内容重算。
+- `GET /api/transfer-overview`、`GET /api/transfer-orders`、`/transfer`：剩余容量与待执行单视图、存档列表和转供页面。
 - `GET /api/plans/{id}`、`GET /api/state`、`GET /api/health`：详情、状态和健康检查。
+
+转供功能按职责分三个文件：`transfer_rules.py`（判定，纯函数）、`transfer_store.py`（存档，含待执行单唯一约束与重算）、`static/transfer.html`（界面）。
 
 ## 测试
 
