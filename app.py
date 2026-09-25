@@ -11,6 +11,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from transfer_rules import evaluate_transfer, remaining_capacity
+from transfer_store import TransferStore
+
 DB_PATH = Path(__file__).with_name("data.db")
 
 
@@ -116,6 +119,17 @@ class GridService:
                 self.store.audit(actor, "asset.register", "asset", cur.lastrowid, {"code": code, "capacity_mw": capacity_mw, "region": region})
         except sqlite3.IntegrityError as exc: raise ApiError(409, "资产代号已存在") from exc
         return {"id": cur.lastrowid, "code": code, "name": name, "asset_type": asset_type, "capacity_mw": capacity_mw, "region": region, "parent_id": parent_id}
+
+    def update_asset_capacity(self, actor: str | None, role: str | None, asset_id: int, capacity_mw: float) -> dict:
+        actor = self._actor(actor, role, {"dispatcher"})
+        asset = self._row("assets", asset_id)
+        capacity_mw = float(capacity_mw)
+        if capacity_mw <= 0: raise ApiError(400, "容量必须为正数")
+        with self.conn:
+            self.conn.execute("UPDATE assets SET capacity_mw=? WHERE id=?", (capacity_mw, asset_id))
+            self.store.audit(actor, "asset.capacity_update", "asset", asset_id,
+                             {"code": asset["code"], "old_capacity_mw": asset["capacity_mw"], "new_capacity_mw": capacity_mw})
+        return {"id": asset_id, "code": asset["code"], "capacity_mw": capacity_mw}
 
     def register_facility(self, actor: str | None, role: str | None, name: str, facility_type: str, asset_id: int, priority: int, backup_power_mw: float) -> dict:
         actor = self._actor(actor, role, {"dispatcher"})
@@ -337,8 +351,128 @@ class GridService:
             self.register_facility("dispatcher-demo", "dispatcher", "市医院", "hospital", a["id"], 1, 50)
 
 
+class TransferService:
+    """备用线路转供：登记源/目标线路、负荷与重要用户；判定见 transfer_rules，存档见 transfer_store。"""
+
+    def __init__(self, store: Store):
+        self.store, self.conn = store, store.conn
+        self.transfers = TransferStore(store.conn)
+
+    def _line(self, line_id: int) -> sqlite3.Row:
+        row = self.conn.execute("SELECT * FROM assets WHERE id=?", (int(line_id),)).fetchone()
+        if not row: raise ApiError(404, "线路不存在")
+        if row["asset_type"] != "line": raise ApiError(400, "转供的源和目标都必须是线路资产")
+        return row
+
+    def _users_checked(self, source_line_id: int, user_ids: list[int]) -> list[dict]:
+        users, seen = [], set()
+        for raw in user_ids:
+            fid = int(raw)
+            if fid in seen: continue
+            row = self.conn.execute("SELECT * FROM facilities WHERE id=?", (fid,)).fetchone()
+            if not row: raise ApiError(404, f"重要用户不存在：{fid}")
+            if row["asset_id"] != source_line_id: raise ApiError(400, "重要用户不属于源线路")
+            seen.add(fid)
+            users.append({"id": row["id"], "name": row["name"], "facility_type": row["facility_type"],
+                          "priority": row["priority"], "backup_power_mw": row["backup_power_mw"]})
+        return users
+
+    def _reserve_mw(self, line_code: str) -> float:
+        """恢复预留：执行中恢复计划在该线路上占用的容量。"""
+        total = 0.0
+        for row in self.conn.execute("SELECT steps_json FROM plans WHERE state='active'"):
+            total += sum(float(s["required_mw"]) for s in json.loads(row["steps_json"]) if s["asset"] == line_code)
+        return round(total, 6)
+
+    def _evaluate(self, source: sqlite3.Row, target: sqlite3.Row, load_mw: float, users: list[dict]) -> tuple[dict, dict]:
+        committed = self.transfers.committed_load(target["id"])
+        reserve = self._reserve_mw(target["code"])
+        required = {r["id"] for r in self.conn.execute(
+            "SELECT id FROM facilities WHERE asset_id=? AND priority=1 AND connected=1", (source["id"],))}
+        decision = evaluate_transfer(capacity_mw=float(target["capacity_mw"]), committed_mw=committed,
+                                     reserve_mw=reserve, requested_load_mw=float(load_mw),
+                                     required_user_ids=required, carried_users=users)
+        snapshot = {"target_capacity_mw": float(target["capacity_mw"]), "committed_mw": committed, "reserve_mw": reserve}
+        return decision, snapshot
+
+    def submit(self, actor: str | None, role: str | None, source_line_id: int, target_line_id: int,
+               load_mw: float, important_user_ids: list[int], note: str = "") -> dict:
+        actor = GridService._actor(actor, role, {"dispatcher"})
+        source, target = self._line(source_line_id), self._line(target_line_id)
+        if source["id"] == target["id"]: raise ApiError(400, "源线路与目标线路不能是同一条")
+        load_mw = float(load_mw)
+        if load_mw <= 0: raise ApiError(400, "转供负荷必须为正数")
+        users = self._users_checked(source["id"], important_user_ids or [])
+        signature = {"source_line_id": source["id"], "load_mw": round(load_mw, 6),
+                     "important_user_ids": sorted(u["id"] for u in users)}
+        existing = self.transfers.pending_for_target(target["id"])
+        if existing and existing["signature"] == signature:
+            return {**existing, "deduplicated": True}  # 重复提交沿用首次结果
+        decision, snapshot = self._evaluate(source, target, load_mw, users)
+        with self.conn:
+            if existing:  # 转供内容变化：原许可失效，重算后另起一笔
+                self.transfers.invalidate(existing["id"], "转供内容变更，原许可失效并重算")
+                self.store.audit(actor, "transfer.invalidate", "transfer_order", existing["id"], {"reason": "转供内容变更"})
+            order = self.transfers.create(source_line_id=source["id"], target_line_id=target["id"], load_mw=load_mw,
+                                          important_users=users, signature=signature, decision=decision,
+                                          snapshot=snapshot, note=note, actor=actor)
+            self.store.audit(actor, "transfer.submit", "transfer_order", order["id"],
+                             {"source": source["code"], "target": target["code"], "load_mw": load_mw,
+                              "approved": decision["approved"], "users": [u["id"] for u in users]})
+        return {**order, "deduplicated": False}
+
+    def execute(self, actor: str | None, role: str | None, order_id: int) -> dict:
+        actor = GridService._actor(actor, role, {"dispatcher"})
+        order = self.transfers.get(int(order_id))
+        if not order: raise ApiError(404, "转供单不存在")
+        if order["state"] != "pending": raise ApiError(409, "只有待执行单可以执行")
+        source, target = self._line(order["source_line_id"]), self._line(order["target_line_id"])
+        decision, snapshot = self._evaluate(source, target, order["load_mw"], order["important_users"])
+        if not decision["approved"]:  # 执行前复核失败：许可失效
+            with self.conn:
+                self.transfers.invalidate(order["id"], "执行前复核未通过，许可失效")
+                self.store.audit(actor, "transfer.invalidate", "transfer_order", order["id"],
+                                 {"reason": "执行前复核未通过", "decision": decision})
+            raise ApiError(409, "执行前复核未通过，转供单已失效")
+        with self.conn:
+            self.transfers.replace_decision(order["id"], decision, snapshot)
+            executed = self.transfers.mark_executed(order["id"])
+            if executed["state"] != "executed": raise ApiError(409, "转供单状态冲突")
+            self.store.audit(actor, "transfer.execute", "transfer_order", order["id"],
+                             {"target": target["code"], "load_mw": order["load_mw"]})
+        return executed
+
+    def recalculate_for_line(self, actor: str, line_id: int) -> list[dict]:
+        """线路容量变化后，涉及该线路的待执行单原许可失效并重算。"""
+        updated = []
+        for order in self.transfers.pending_for_line(int(line_id)):
+            source, target = self._line(order["source_line_id"]), self._line(order["target_line_id"])
+            decision, snapshot = self._evaluate(source, target, order["load_mw"], order["important_users"])
+            if snapshot == order["snapshot"]: continue
+            with self.conn:
+                updated_order = self.transfers.replace_decision(order["id"], decision, snapshot)
+                self.store.audit(actor, "transfer.recalculate", "transfer_order", order["id"],
+                                 {"reason": "线路容量变化，原许可失效并重算", "approved": decision["approved"]})
+            updated.append(updated_order)
+        return updated
+
+    def overview(self) -> dict:
+        lines = []
+        for row in self.conn.execute("SELECT * FROM assets WHERE asset_type='line' ORDER BY id"):
+            committed = self.transfers.committed_load(row["id"])
+            reserve = self._reserve_mw(row["code"])
+            facilities = [dict(f) for f in self.conn.execute(
+                "SELECT * FROM facilities WHERE asset_id=? ORDER BY priority,id", (row["id"],))]
+            lines.append({"id": row["id"], "code": row["code"], "name": row["name"], "region": row["region"],
+                          "capacity_mw": row["capacity_mw"], "committed_mw": committed, "reserve_mw": reserve,
+                          "remaining_mw": remaining_capacity(row["capacity_mw"], committed, reserve),
+                          "facilities": facilities})
+        return {"lines": lines, "pending": self.transfers.list_pending(), "orders": self.transfers.list_orders()}
+
+
 class Handler(BaseHTTPRequestHandler):
     service: GridService
+    transfers: TransferService
 
     def log_message(self, fmt: str, *args: object) -> None: sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
     def _send(self, status: int, body: object) -> None:
@@ -354,7 +488,10 @@ class Handler(BaseHTTPRequestHandler):
             p = self._parts()
             if p in (["health"], ["api", "health"]): out = {"status": "ok"}
             elif p == ["api", "state"]: out = self.service.state()
+            elif p == ["api", "transfers"]: out = self.transfers.overview()
             elif len(p) == 3 and p[:2] == ["api", "plans"]: out = self.service.plan_detail(int(p[2]))
+            elif p == ["transfers"]:
+                page = (Path(__file__).parent / "static" / "transfers.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
             elif not p:
                 page = (Path(__file__).parent / "static" / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
             else: raise ApiError(404, "接口不存在")
@@ -377,6 +514,11 @@ class Handler(BaseHTTPRequestHandler):
             elif p == ["api", "field-reports"]: out = self.service.field_report(actor, role, int(b.get("plan_id", 0)), int(b.get("step_no", 0)), b.get("client_report_id", ""), int(b.get("expected_plan_version", 0)), b.get("status", ""), b.get("note", ""))
             elif len(p) == 4 and p[:2] == ["api", "plans"] and p[3] == "confirm": out = self.service.confirm_step(actor, role, int(p[2]), int(b.get("step_no", 0)), b.get("decision", "confirmed"), b.get("note", ""))
             elif p == ["api", "status"]: out = self.service.publish_status(actor, role, int(b.get("outage_id", 0)), int(b.get("plan_id", 0)))
+            elif p == ["api", "transfers"]: out = self.transfers.submit(actor, role, int(b.get("source_line_id", 0)), int(b.get("target_line_id", 0)), float(b.get("load_mw", 0)), b.get("important_user_ids") or [], b.get("note", ""))
+            elif len(p) == 4 and p[:2] == ["api", "transfers"] and p[3] == "execute": out = self.transfers.execute(actor, role, int(p[2]))
+            elif len(p) == 4 and p[:2] == ["api", "assets"] and p[3] == "capacity":
+                asset = self.service.update_asset_capacity(actor, role, int(p[2]), float(b.get("capacity_mw", 0)))
+                out = {"asset": asset, "recalculated": self.transfers.recalculate_for_line(actor, int(p[2]))}
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
         except ApiError as exc: self._send(exc.status, {"error": exc.message})
@@ -388,6 +530,7 @@ def run(port: int, db_path: str, seed: bool) -> None:
     store = Store(db_path); service = GridService(store)
     if seed: service.seed()
     Handler.service = service
+    Handler.transfers = TransferService(store)
     print(f"grid restoration listening on http://127.0.0.1:{port}")
     ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 
@@ -395,7 +538,8 @@ def run(port: int, db_path: str, seed: bool) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(); parser.add_argument("--port", type=int, default=8215); parser.add_argument("--db", default=str(DB_PATH)); parser.add_argument("--init", action="store_true"); parser.add_argument("--seed", action="store_true")
     args = parser.parse_args()
-    if args.init: Store(args.db).close()
+    if args.init:
+        store = Store(args.db); TransferStore(store.conn); store.close()
     if args.seed or not args.init: run(args.port, args.db, args.seed)
 
 

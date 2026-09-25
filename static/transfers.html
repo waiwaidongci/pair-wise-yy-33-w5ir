@@ -1,0 +1,97 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>备用线路转供管理</title>
+<style>
+body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}
+table{border-collapse:collapse;width:100%;margin:12px 0}
+th,td{border:1px solid #d0d7de;padding:6px 10px;text-align:left;font-size:14px}
+.ok{color:#1a7f37;font-weight:600}.bad{color:#cf222e;font-weight:600}
+button{padding:6px 12px}input,select{padding:6px;margin:2px}
+#msg{white-space:pre-wrap;background:#f3f5f7;padding:10px;min-height:1.2em}
+</style>
+<h1>备用线路转供管理</h1>
+<p>登记源线路、目标线路、转供负荷与重要用户。扣除原有承接及恢复预留后仍有余量、且一级重要用户全部纳入才准执行；同一目标线路只保留一笔待执行单，重复提交沿用首次结果；容量或内容变化后原许可失效并重算。</p>
+
+<h2>新建转供单</h2>
+<div>
+源线路 <select id="src" onchange="renderUsers()"></select>
+目标线路 <select id="tgt"></select>
+负荷 <input id="loadmw" type="number" step="0.1" min="0" value="20" style="width:90px"> MW
+<button onclick="submitOrder()">提交转供单</button>
+</div>
+<div id="users"></div>
+<pre id="msg"></pre>
+
+<h2>线路剩余容量</h2><div id="lines"></div>
+<h2>待执行单</h2><div id="pending"></div>
+<h2>近期转供单</h2><div id="orders"></div>
+<p><a href="/">返回恢复调度主页</a></p>
+
+<script>
+const H={"Content-Type":"application/json","X-Actor":"dispatcher-demo","X-Role":"dispatcher"};
+const $=id=>document.getElementById(id);
+const mw=v=>Number(v).toFixed(1);
+let data={lines:[],pending:[],orders:[]};
+const code=id=>{const l=data.lines.find(x=>x.id==id);return l?l.code:id};
+
+async function refresh(){
+  data=await (await fetch('/api/transfers')).json();
+  fillSelects();renderUsers();renderLines();renderPending();renderOrders();
+}
+function fillSelects(){
+  const s=$('src').value,t=$('tgt').value;
+  const opts=data.lines.map(l=>`<option value="${l.id}">${l.code} ${l.name}</option>`).join('');
+  $('src').innerHTML=opts;$('tgt').innerHTML=opts;
+  if(s)$('src').value=s;if(t)$('tgt').value=t;
+}
+function renderUsers(){
+  const line=data.lines.find(l=>l.id==$('src').value);
+  const fs=line?line.facilities:[];
+  $('users').innerHTML=fs.length?('重要用户：'+fs.map(f=>
+    `<label><input type="checkbox" class="u" value="${f.id}" ${f.priority==1?'checked':''}> ${f.name}(P${f.priority},${mw(f.backup_power_mw)}MW)</label>`
+  ).join(' ')):'';
+}
+async function submitOrder(){
+  const ids=[...document.querySelectorAll('.u:checked')].map(x=>Number(x.value));
+  const r=await fetch('/api/transfers',{method:'POST',headers:H,body:JSON.stringify({
+    source_line_id:Number($('src').value),target_line_id:Number($('tgt').value),
+    load_mw:Number($('loadmw').value),important_user_ids:ids})});
+  const d=await r.json();
+  $('msg').textContent=d.error?('错误：'+d.error):
+    (`转供单 #${d.id}${d.deduplicated?'（重复提交，沿用首次结果）':''}\n判定：${d.decision.approved?'准许执行':'不准许'}\n${(d.decision.reasons||[]).join('\n')}`);
+  refresh();
+}
+async function execute(id){
+  const r=await fetch(`/api/transfers/${id}/execute`,{method:'POST',headers:H,body:'{}'});
+  const d=await r.json();
+  $('msg').textContent=d.error?('错误：'+d.error):`转供单 #${d.id} 已执行`;
+  refresh();
+}
+async function setCap(id){
+  const r=await fetch(`/api/assets/${id}/capacity`,{method:'POST',headers:H,body:JSON.stringify({capacity_mw:Number($('cap'+id).value)})});
+  const d=await r.json();
+  $('msg').textContent=d.error?('错误：'+d.error):`容量已更新，${d.recalculated.length} 笔待执行单原许可失效并重算`;
+  refresh();
+}
+function renderLines(){
+  $('lines').innerHTML='<table><tr><th>线路</th><th>容量MW</th><th>原有承接</th><th>恢复预留</th><th>剩余容量</th><th>重要用户</th><th>调整容量</th></tr>'+
+  data.lines.map(l=>`<tr><td>${l.code} ${l.name}</td><td>${mw(l.capacity_mw)}</td><td>${mw(l.committed_mw)}</td><td>${mw(l.reserve_mw)}</td>`+
+    `<td class="${l.remaining_mw>0?'ok':'bad'}">${mw(l.remaining_mw)}</td>`+
+    `<td>${l.facilities.map(f=>`${f.name}(P${f.priority})`).join('、')||'—'}</td>`+
+    `<td><input id="cap${l.id}" type="number" step="0.1" value="${l.capacity_mw}" style="width:80px"><button onclick="setCap(${l.id})">更新</button></td></tr>`).join('')+'</table>';
+}
+function renderPending(){
+  $('pending').innerHTML=data.pending.length?
+    '<table><tr><th>#</th><th>源→目标</th><th>负荷MW</th><th>重要用户</th><th>判定</th><th>原因</th><th></th></tr>'+
+    data.pending.map(o=>`<tr><td>${o.id}</td><td>${code(o.source_line_id)} → ${code(o.target_line_id)}</td><td>${mw(o.load_mw)}</td>`+
+      `<td>${o.important_users.map(u=>u.name).join('、')||'—'}</td>`+
+      `<td class="${o.decision.approved?'ok':'bad'}">${o.decision.approved?'准许':'不准许'}</td>`+
+      `<td>${(o.decision.reasons||[]).join('；')}</td>`+
+      `<td>${o.decision.approved?`<button onclick="execute(${o.id})">执行</button>`:''}</td></tr>`).join('')+'</table>'
+    :'<p>暂无待执行单</p>';
+}
+function renderOrders(){
+  $('orders').innerHTML='<table><tr><th>#</th><th>状态</th><th>源→目标</th><th>负荷MW</th><th>版本</th><th>说明</th><th>更新时间</th></tr>'+
+  data.orders.map(o=>`<tr><td>${o.id}</td><td>${o.state}</td><td>${code(o.source_line_id)} → ${code(o.target_line_id)}</td><td>${mw(o.load_mw)}</td>`+
+    `<td>${o.revision}</td><td>${o.invalidated_reason||o.note||''}</td><td>${o.updated_at}</td></tr>`).join('')+'</table>';
+}
+refresh();
+</script>
